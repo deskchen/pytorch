@@ -277,7 +277,14 @@ std::unique_ptr<ObserverContext> tracerOnFunctionEnter(const RecordFunction& fn)
         }
       }
       // TODO: support convolution_backward in bindings so we don't need to find its subcalls
-      bool this_is_aten = fn_name.find("aten::") == 0 && fn_name != "aten::convolution_backward";
+      // Trace ops from multiple namespaces:
+      //   - aten::*   standard PyTorch ops
+      //   - _C::*     vLLM's custom CUDA ops (paged_attention, rms_norm, etc.)
+      //   - vllm::*   vLLM's high-level wrappers (unified_attention, all_reduce, ...)
+      bool this_is_aten =
+          (fn_name.find("aten::") == 0 && fn_name != "aten::convolution_backward")
+          || fn_name.find("_C::") == 0
+          || fn_name.find("vllm::") == 0;
       tracer->call_stack.push_back(this_is_aten);
 
       if (!parent_is_aten && this_is_aten) {
