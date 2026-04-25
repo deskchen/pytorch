@@ -10,7 +10,10 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include <ATen/core/TensorBody.h>
@@ -238,6 +241,208 @@ void sendOneCall(
   }
 }
 
+// =====================================================================
+// Phantora binary TorchCall protocol (tag = \x04)
+// =====================================================================
+// Wire schema (must match Rust side parse_torch_call_binary in
+// phantora/phantora/src/torch_call.rs):
+//   u32  pid
+//   i32  tid
+//   u8   hostname_len + N bytes
+//   u8   stream_present  (0 or 1; if 1: i32 device + i32 id)
+//   i64  cur_sim_time
+//   u16  name_len + N bytes
+//   u8   num_args
+//   args (each TorchValue):
+//     u8 type tag (0=Tensor 1=Tuple 2=List 3=Double 4=Int 5=Bool 6=String 7=Device)
+//     Tensor: u8 ndim + i64*ndim shape + i32 dtype + u8 device_kind + (cuda? u8 idx)
+//     Tuple/List: u16 nelems + recursive
+//     Double: f64
+//     Int: i64
+//     Bool: u8
+//     String: u16 len + N bytes
+//     Device: u8 device_kind + (cuda? u8 idx)
+//
+// All multi-byte integers little-endian (x86 native — append raw bytes).
+inline void wu8(std::string& s, uint8_t v)  { s.push_back(static_cast<char>(v)); }
+inline void wu16(std::string& s, uint16_t v) { s.append(reinterpret_cast<const char*>(&v), 2); }
+inline void wu32(std::string& s, uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); }
+inline void wi32(std::string& s, int32_t v)  { s.append(reinterpret_cast<const char*>(&v), 4); }
+inline void wi64(std::string& s, int64_t v)  { s.append(reinterpret_cast<const char*>(&v), 8); }
+inline void wf64(std::string& s, double v)   { s.append(reinterpret_cast<const char*>(&v), 8); }
+
+inline void encodeDevice(std::string& s, const c10::Device& dev) {
+  if (dev.is_cuda()) {
+    wu8(s, 1);
+    wu8(s, static_cast<uint8_t>(at::cuda::current_device()));
+  } else {
+    // cpu / meta / other → cpu (matches Rust parse_device fallback)
+    wu8(s, 0);
+  }
+}
+
+// Returns true if encoded (and any bytes appended), false if val should be
+// skipped at the call site. Mirrors jsonIValue's optional return.
+bool encodeValue(std::string& s, const c10::IValue& val, size_t maxArrayLen);
+
+bool encodeValue(std::string& s, const c10::IValue& val, size_t maxArrayLen) {
+  if (val.isTensor()) {
+    const auto& t = val.toTensor();
+    if (!t.has_storage()) return false;
+    wu8(s, 0);  // VAL_TENSOR
+    auto sizes = t.sizes();
+    uint8_t ndim = static_cast<uint8_t>(std::min<size_t>(sizes.size(), 255));
+    wu8(s, ndim);
+    for (uint8_t i = 0; i < ndim; ++i) {
+      wi64(s, static_cast<int64_t>(sizes[i]));
+    }
+    auto dtype = t.dtype().toScalarType();
+    wi32(s, static_cast<int32_t>(dtype));
+    encodeDevice(s, t.device());
+    return true;
+  } else if (val.isTuple()) {
+    wu8(s, 1);  // VAL_TUPLE
+    size_t count_pos = s.size();
+    wu16(s, 0);  // backpatched after counting
+    uint16_t actual = 0;
+    const auto& elements = val.toTupleRef().elements();
+    for (size_t j = 0; j < elements.size(); ++j) {
+      if (encodeValue(s, elements[j], maxArrayLen)) {
+        if (++actual == 0xFFFF) break;
+      }
+    }
+    std::memcpy(&s[count_pos], &actual, 2);
+    return true;
+  } else if (val.isList()) {
+    wu8(s, 2);  // VAL_LIST
+    size_t count_pos = s.size();
+    wu16(s, 0);
+    uint16_t actual = 0;
+    auto list = val.toList();
+    for (size_t j = 0; j < list.size(); ++j) {
+      if (j >= maxArrayLen) {
+        LOG(WARNING) << "list size=" << list.size()
+                     << " exceeded maxArrayLen=" << maxArrayLen;
+        break;
+      }
+      if (encodeValue(s, list.get(j), maxArrayLen)) {
+        if (++actual == 0xFFFF) break;
+      }
+    }
+    std::memcpy(&s[count_pos], &actual, 2);
+    return true;
+  } else if (val.isDouble()) {
+    double d = val.toDouble();
+    if (std::isinf(d)) {
+      d = (d > 0) ? std::numeric_limits<double>::max()
+                  : -std::numeric_limits<double>::max();
+    }
+    if (std::isnan(d)) d = 0;
+    wu8(s, 3);  // VAL_DOUBLE
+    wf64(s, d);
+    return true;
+  } else if (val.isInt()) {
+    wu8(s, 4);  // VAL_INT
+    wi64(s, val.toInt());
+    return true;
+  } else if (val.isBool()) {
+    wu8(s, 5);  // VAL_BOOL
+    wu8(s, val.toBool() ? 1 : 0);
+    return true;
+  } else if (val.isString()) {
+    wu8(s, 6);  // VAL_STRING
+    const auto& sv = val.toStringRef();
+    size_t n = std::min<size_t>(sv.size(), std::min<size_t>(maxArrayLen, 65535));
+    wu16(s, static_cast<uint16_t>(n));
+    s.append(sv.data(), n);
+    return true;
+  } else if (val.isDevice()) {
+    wu8(s, 7);  // VAL_DEVICE
+    encodeDevice(s, val.toDevice());
+    return true;
+  }
+  return false;
+}
+
+// Hostname cached process-wide — gethostname() syscall is hot otherwise.
+inline const std::pair<const char*, uint8_t>& cachedHostname() {
+  static std::pair<const char*, uint8_t> cached = []() {
+    static char buf[256];
+    if (gethostname(buf, sizeof(buf)) != 0) {
+      const char* fallback = "UNKNOWN_HOST";
+      std::strncpy(buf, fallback, sizeof(buf));
+    }
+    buf[sizeof(buf) - 1] = '\0';
+    size_t len = std::strlen(buf);
+    if (len > 255) len = 255;
+    return std::make_pair(static_cast<const char*>(buf), static_cast<uint8_t>(len));
+  }();
+  return cached;
+}
+
+template <typename Inputs>
+void sendOneCallBinary(
+    int simulator_sock_fd,
+    long cur_sim_time,
+    const char* name,
+    const Inputs& inputs,
+    size_t arg_begin,
+    size_t arg_end) {
+  thread_local std::string buf;
+  buf.clear();
+
+  wu32(buf, static_cast<uint32_t>(getpid()));
+  wi32(buf, static_cast<int32_t>(gettid()));
+
+  // hostname
+  const auto& host = cachedHostname();
+  wu8(buf, host.second);
+  buf.append(host.first, host.second);
+
+  // stream
+  auto stream_raw = at::cuda::getCurrentCUDAStream().stream();
+  if (stream_raw) {
+    struct _cudaStream { int device; int id; };
+    auto* st = reinterpret_cast<_cudaStream*>(stream_raw);
+    wu8(buf, 1);
+    wi32(buf, st->device);
+    wi32(buf, st->id);
+  } else {
+    wu8(buf, 0);
+  }
+
+  wi64(buf, static_cast<int64_t>(cur_sim_time));
+
+  // op name
+  size_t name_len = std::strlen(name);
+  if (name_len > 65535) name_len = 65535;
+  wu16(buf, static_cast<uint16_t>(name_len));
+  buf.append(name, name_len);
+
+  // args — encode then back-patch the count
+  size_t nargs_pos = buf.size();
+  wu8(buf, 0);  // placeholder
+  uint8_t actual = 0;
+  for (size_t i = arg_begin; i < arg_end; ++i) {
+    if (encodeValue(buf, inputs[i], 4096)) {
+      if (++actual == 255) break;
+    }
+  }
+  buf[nargs_pos] = static_cast<char>(actual);
+
+  // tag byte (must match main.rs dispatch)
+  wu8(buf, 4);
+
+  auto ret = send(simulator_sock_fd, buf.data(), buf.size(), 0);
+  if (ret < 0) {
+    if (errno == EMSGSIZE) {
+      LOG(WARNING) << "Large binary message (" << buf.size() << ") for \"" << name << "\"";
+    } else {
+      LOG(WARNING) << "Failed to send \"" << name << "\" to simulator: " << strerror(errno);
+    }
+  }
+}
+
 static inline long current_cpu_time_us() {
   struct timespec ts;
   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
@@ -306,14 +511,12 @@ std::unique_ptr<ObserverContext> tracerOnFunctionEnter(const RecordFunction& fn)
           }
 
           if (has_cuda_tensor) {
-            std::vector<std::string> args;
-            for (const auto i : c10::irange(size_inputs - num_inputs, size_inputs)) {
-              const auto arg_json = jsonIValue(inputs[i]);
-              if (arg_json.has_value()) {
-                args.emplace_back(arg_json.value());
-              }
-            }
-            sendOneCall(tracer->simulator_sock_fd, cur_sim_time, fn_name.c_str(), args);
+            // Phantora: emit the binary TorchCall encoding directly.
+            // Old JSON path (jsonIValue + sendOneCall) is kept above
+            // for reference / rollback but not invoked from the hot path.
+            sendOneCallBinary(tracer->simulator_sock_fd, cur_sim_time,
+                              fn_name.c_str(), inputs,
+                              size_inputs - num_inputs, size_inputs);
           }
         }
       }
