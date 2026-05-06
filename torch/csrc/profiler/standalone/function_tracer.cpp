@@ -443,10 +443,13 @@ void sendOneCallBinary(
   }
 }
 
-static inline long current_cpu_time_us() {
+// Returns nanoseconds — must agree with the simulator's internal sim
+// clock unit, which switched from µs to ns to recover ~0.5 µs of
+// per-op rounding precision in TorchEstimator's cost model.
+static inline long current_cpu_time_ns() {
   struct timespec ts;
   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
-  return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+  return ts.tv_sec * 1000000000L + ts.tv_nsec;
 }
 
 struct TORCH_API FunctionTracer {
@@ -469,7 +472,7 @@ std::unique_ptr<ObserverContext> tracerOnFunctionEnter(const RecordFunction& fn)
     try {
       const std::lock_guard<std::mutex> lock(tracer->g_mutex);
 
-      auto start_time = current_cpu_time_us();
+      auto start_time = current_cpu_time_ns();
       long cur_sim_time = tracer->get_time_long();
 
       auto fn_name = std::string(fn.name());
@@ -521,7 +524,7 @@ std::unique_ptr<ObserverContext> tracerOnFunctionEnter(const RecordFunction& fn)
         }
       }
 
-      auto end_time = current_cpu_time_us();
+      auto end_time = current_cpu_time_ns();
       tracer->subtract_cpu_time(end_time - start_time);
     } catch (const std::exception& e) {
       LOG(WARNING) << "Exception in function tracer (enter): " << e.what();
