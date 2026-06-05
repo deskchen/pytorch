@@ -10,6 +10,7 @@
 #include <torch/csrc/profiler/collection.h>
 #include <torch/csrc/profiler/python/combined_traceback.h>
 #include <torch/csrc/profiler/standalone/execution_trace_observer.h>
+#include <torch/csrc/profiler/standalone/function_tracer.h>
 #include <torch/csrc/utils/pybind.h>
 
 struct THPCapturedTraceback {
@@ -660,6 +661,13 @@ void initPythonBindings(PyObject* module) {
   m.def(
       "_disable_execution_trace_observer",
       &torch::profiler::impl::disableExecutionTraceObserver);
+  m.def(
+      "_enable_function_tracer",
+      &torch::profiler::impl::enableFunctionTracer,
+      py::arg("simulator_socket_path"));
+  m.def(
+      "_disable_function_tracer",
+      &torch::profiler::impl::disableFunctionTracer);
   m.def(
       "_set_record_concrete_inputs_enabled_val",
       &torch::profiler::impl::set_record_concrete_inputs_enabled_val);

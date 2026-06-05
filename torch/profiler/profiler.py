@@ -19,8 +19,10 @@ from torch._C._profiler import (
     _add_execution_trace_observer,
     _disable_execution_trace_observer,
     _enable_execution_trace_observer,
+    _enable_function_tracer,
     _ExperimentalConfig,
     _remove_execution_trace_observer,
+    _disable_function_tracer,
 )
 from torch._environment import is_fbcode
 from torch._utils_internal import profiler_allow_cudagraph_cupti_lazy_reinit_cuda12
@@ -35,6 +37,8 @@ __all__ = [
     "tensorboard_trace_handler",
     "profile",
     "ExecutionTraceObserver",
+    "enable_function_tracer",
+    "disable_function_tracer",
 ]
 PROFILER_STEP_NAME = "ProfilerStep"
 
@@ -1188,3 +1192,11 @@ class ExecutionTraceObserver(_ITraceObserver):
                 "## process_group:init ##",
                 json.dumps(pg_config_info, cls=_NumpyEncoder),
             )
+
+
+def enable_function_tracer(simulator_socket_path: str) -> None:
+    _enable_function_tracer(simulator_socket_path)
+
+
+def disable_function_tracer() -> None:
+    _disable_function_tracer()

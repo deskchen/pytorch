@@ -742,6 +742,7 @@ libtorch_cuda_core_sources = [
     "torch/csrc/inductor/aoti_torch/shim_cuda.cpp",
     "torch/csrc/jit/codegen/fuser/cuda/fused_kernel.cpp",
     "torch/csrc/profiler/stubs/cuda.cpp",
+    "torch/csrc/profiler/standalone/function_tracer.cpp",
     "torch/csrc/autograd/functions/comm.cpp",
     "torch/csrc/jit/passes/frozen_conv_add_relu_fusion_cuda.cpp",
     "torch/csrc/jit/tensorexpr/cuda_codegen.cpp",
