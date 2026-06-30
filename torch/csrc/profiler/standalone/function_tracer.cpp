@@ -471,13 +471,27 @@ struct TORCH_API FunctionTracer {
 
 using TracerManager = GlobalStateManager<FunctionTracer>;
 
+// Cached PHANTORA_IGNORE_CPU_TIME flag (the stub's phantora_ignore_cpu_time(), resolved once at
+// tracer setup). When 1, the enter hook skips its per-op overhead-timing reads — the dominant
+// per-op cost (see docs/sim-wallclock-overhead-and-speedup.md) — and the subtract they feed;
+// safe because subtract_cpu_time only adjusts the clock when !ignore_cpu_time, so it is already a
+// no-op under =1. The =0 path is untouched and byte-identical.
+//
+// Written once in enableFunctionTracer (below) BEFORE addGlobalCallback publishes the hook, so a
+// plain int needs no synchronization; both fallbacks (-1 unset, 0 symbol-absent) take the safe
+// full-timing path, so even an early read cannot wrongly skip the =0 subtract.
+static int g_phantora_ignore_cpu = -1;
+
 std::unique_ptr<ObserverContext> tracerOnFunctionEnter(const RecordFunction& fn) {
   auto tracer = TracerManager::get();
   if (tracer != nullptr) {
     try {
       const std::lock_guard<std::mutex> lock(tracer->g_mutex);
 
-      auto start_time = current_cpu_time_ns();
+      // =1 fast path: skip the per-op overhead-timing reads + their inert subtract (see
+      // g_phantora_ignore_cpu above). =0 keeps full timing.
+      const bool phantora_skip_timing = (g_phantora_ignore_cpu == 1);
+      auto start_time = phantora_skip_timing ? 0L : current_cpu_time_ns();
       if (tracer->get_time_long == nullptr ||
           tracer->subtract_cpu_time == nullptr) {
         return nullptr;
@@ -533,8 +547,10 @@ std::unique_ptr<ObserverContext> tracerOnFunctionEnter(const RecordFunction& fn)
         }
       }
 
-      auto end_time = current_cpu_time_ns();
-      tracer->subtract_cpu_time(end_time - start_time);
+      if (!phantora_skip_timing) {
+        auto end_time = current_cpu_time_ns();
+        tracer->subtract_cpu_time(end_time - start_time);
+      }
     } catch (const std::exception& e) {
       LOG(WARNING) << "Exception in function tracer (enter): " << e.what();
     }
@@ -607,6 +623,10 @@ void enableFunctionTracer(const std::string& simulator_sock_path) {
     } else {
       tracer->subtract_cpu_time = (void (*)(long))subtract_cpu_time;
     }
+
+    // Resolve the stub's cached ignore-cpu-time flag once (drives the enter-hook fast path).
+    auto ignore_cpu = dlsym(cudalib_handle, "phantora_ignore_cpu_time");
+    g_phantora_ignore_cpu = (ignore_cpu != nullptr) ? ((int (*)())ignore_cpu)() : 0;
   }
 
   if (tracer->get_time_long == nullptr ||
